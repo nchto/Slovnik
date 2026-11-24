@@ -332,6 +332,7 @@ function renderHome() {
   const qi = S.quoteIndex(now, state.quoteShift), [qt, qa] = S.QUOTES[qi];
   let html = "";
   if (state.flash && state.flash.until > now) html += `<p class="notice">${esc(state.flash.text)}</p>`;
+  if (state.localOffer) html += `<div class="notice" style="display:flex;flex-direction:column;gap:10px"><p><b>На этом устройстве есть ${state.localOffer.decks.length} ${plural(state.localOffer.decks.length, "колода", "колоды", "колод")} (${state.localOffer.cards} ${plural(state.localOffer.cards, "карточка", "карточки", "карточек")}), созданных без аккаунта.</b> Перенести их в аккаунт вместе с прогрессом? Тогда они будут на всех ваших устройствах.</p><div class="row"><button class="btn" data-act="move-local">Перенести в аккаунт</button><button class="btn ghost" data-act="skip-local">Не сейчас</button></div></div>`;
   if (state.storageError) html += `<p class="notice warn"><b>Изменения не сохраняются.</b> ${esc(state.storageError)} Скачайте резервную копию на вкладке «Прогресс», чтобы не потерять прогресс.</p>`;
   if (state.store.kind === "local") html += window.SlovnikCloud && window.SlovnikCloud.enabled
     ? `<div class="notice row between"><span>Вы без аккаунта: колоды хранятся только в этом браузере.</span><button class="btn" data-act="sign-in">Войти</button></div>`
@@ -1218,6 +1219,7 @@ app.addEventListener("click", e => {
     "opts-all": () => { const src = state.decks[state.view.deck]; for (const d of deckList()) if (d !== src) { d.opts = { ...(src.opts || {}) }; d.newPerDay = src.newPerDay; saveDeck(d); } const m = document.getElementById("opts-msg"); m.hidden = false; m.textContent = "Параметры применены ко всем колодам"; },
     "opts-reset": () => { const d = state.decks[state.view.deck]; d.opts = {}; d.newPerDay = S.DEFAULT_NEW_PER_DAY; d.reverse = false; saveDeck(d); render(); },
     "t-source": () => { state.testCfg.source = id; render(); },
+    "move-local": moveLocalDecks, "skip-local": () => { state.localOffer = null; render(); },
     "sample-ar": () => { const d = createDeck("Арабский: первые слова (пример)", SAMPLE_AR.map(([f, b2]) => newCard(f, b2))); d.lang = "ar"; saveDeck(d); go({ name: "home" }); },
     "ak": () => { const kb = b.closest(".arkb"); if (kb) typeKey(kb.dataset.target, b.dataset.k); },
     "ak-toggle": () => {
@@ -1265,12 +1267,39 @@ function onDecks(decks, fromCache) {
   render();
 }
 function onStats(st) { state.stats = st; if (state.ready && (state.view.name === "home" || state.view.name === "progress") && !(document.activeElement && document.activeElement.id === "goal")) render(); }
+async function checkLocalDecks(uid) {
+  const FLAG = "slovnik-moved-" + uid;
+  try { if (localStorage.getItem(FLAG)) return; } catch { return; }
+  let decks = {}, stats = null;
+  try { await makeLocalStore().start(d => { decks = d; }, st => { stats = st; }); } catch { return; }
+  const list = Object.values(decks).filter(d => d.cards.length);
+  if (!list.length) return;
+  state.localOffer = { flag: FLAG, decks: list, stats, cards: list.reduce((n, d) => n + d.cards.length, 0) };
+  if (state.view.name === "home") render();
+}
+function moveLocalDecks() {
+  const o = state.localOffer; if (!o) return;
+  let moved = 0, skipped = 0, cards = 0;
+  for (const d of o.decks) {
+    if (state.decks[d.id]) { skipped++; continue; }
+    saveDeck(deserialize(d.id, serialize(d))); moved++; cards += d.cards.length;
+  }
+  for (const [k, v] of Object.entries((o.stats && o.stats.days) || {})) {
+    const cur = state.stats.days[k] || (state.stats.days[k] = {});
+    for (const [f, n] of Object.entries(v || {})) if (typeof n === "number") cur[f] = Math.max(cur[f] || 0, n);
+  }
+  saveStats();
+  try { localStorage.setItem(o.flag, "1"); } catch {}
+  state.localOffer = null;
+  state.flash = { until: Date.now() + 15000, text: moved ? `Перенесено в аккаунт: ${moved} ${plural(moved, "колода", "колоды", "колод")}, ${cards} ${plural(cards, "карточка", "карточки", "карточек")} с прогрессом.${skipped ? ` Уже были в аккаунте: ${skipped}.` : ""}` : "Эти колоды уже есть в аккаунте." };
+  render();
+}
 async function boot() {
   let store = null;
   try {
     if (window.SlovnikCloud) {
       const s = await window.SlovnikCloud.start(app);
-      if (s) store = makeDbStore(s.db, s.userId);
+      if (s) { store = makeDbStore(s.db, s.userId); setTimeout(() => checkLocalDecks(s.userId), 0); }
     } else if (window.claude && window.claude.use) {
       const [db, user] = await Promise.all([window.claude.use("db"), window.claude.use("user")]);
       const id = user ? await user.id() : null;

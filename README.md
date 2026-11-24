@@ -20,9 +20,10 @@
 
 1. Создайте проект на [supabase.com](https://supabase.com) (бесплатный тариф).
 2. Откройте **SQL Editor**, вставьте содержимое `supabase-schema.sql` и нажмите **Run**.
-3. В **Authentication → URL Configuration** укажите в **Site URL** адрес сайта, например `https://<логин>.github.io/slovnik/`, и добавьте его же в **Redirect URLs**.
-4. Скопируйте `config.example.js` в `config.js` и впишите **Project URL** и публичный ключ (`anon` или `publishable`). Секретный ключ (`service_role` или `secret`) сюда вставлять нельзя.
-5. Включите GitHub Pages: **Settings → Pages → Deploy from a branch → main / (root)**.
+3. В **Authentication → URL Configuration** укажите в **Site URL** адрес сайта, например `https://<логин>.github.io/Slovnik/` (регистр букв как в названии репозитория), и добавьте его же в **Redirect URLs**.
+4. Если пользоваться будут не только участники проекта Supabase, выключите подтверждение почты: **Authentication → Sign In / Providers → Email → Confirm email**. Встроенная почта Supabase отправляет письма только участникам команды проекта. Чтобы письма (подтверждение, сброс пароля) доходили всем, подключите свой SMTP в **Authentication → Emails → SMTP Settings**.
+5. Скопируйте `config.example.js` в `config.js` и впишите **Project URL** и публичный ключ (`anon` или `publishable`). Секретный ключ (`service_role` или `secret`) сюда вставлять нельзя.
+6. Включите GitHub Pages: **Settings → Pages → Deploy from a branch → main / (root)**.
 
 Если `config.js` пустой, приложение работает без аккаунтов и хранит колоды в браузере.
 
