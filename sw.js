@@ -1,4 +1,4 @@
-const VERSION = "slovnik-v1";
+const VERSION = "slovnik-v2";
 const SHELL = ["./", "index.html", "config.js", "core.js", "cloud.js", "ui.js", "vendor/supabase.js", "manifest.webmanifest", "icon-192.png", "icon-512.png", "apple-touch-icon.png"];
 
 self.addEventListener("install", event => {

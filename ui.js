@@ -13,18 +13,73 @@ const hue = s => { let h = 0; for (const ch of s) h = (h * 31 + ch.codePointAt(0
 /* ---------- storage ---------- */
 function makeLocalStore() {
   const KEY = "slovnik-decks", SKEY = "slovnik-stats";
-  const read = (k, d) => { try { return JSON.parse(localStorage.getItem(k) || "null") || d; } catch { return d; } };
-  const write = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } };
+  const lsRead = (k, d) => { try { return JSON.parse(localStorage.getItem(k) || "null") || d; } catch { return d; } };
+  const lsWrite = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } };
+  let idb = null;
+  const openIdb = () => new Promise(res => {
+    try {
+      const rq = indexedDB.open("slovnik", 1);
+      rq.onupgradeneeded = () => { rq.result.createObjectStore("decks"); rq.result.createObjectStore("meta"); };
+      rq.onsuccess = () => res(rq.result); rq.onerror = () => res(null); rq.onblocked = () => res(null);
+    } catch { res(null); }
+  });
+  const tx = (store, mode, fn) => new Promise((res, rej) => {
+    const t = idb.transaction(store, mode), st = t.objectStore(store); const out = fn(st);
+    t.oncomplete = () => res(out && out.result); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error);
+  });
+  const failed = e => { state.storageError = e && e.name === "QuotaExceededError" ? "В браузере закончилось место для данных." : "Браузер не дал сохранить данные."; setSync("Не сохранено"); render(); };
+  const ok = () => { if (state.storageError) { state.storageError = null; render(); } setSync("Сохранено на этом устройстве"); };
+  const JKEY = "slovnik-journal";
+  let chain = Promise.resolve(), seq = 0;
+  const queue = (id, v) => {
+    const n = ++seq;
+    if (!idb) {
+      const all = lsRead(KEY, {}); if (v) all[id] = v; else delete all[id];
+      return lsWrite(KEY, all) ? ok() : failed({ name: "QuotaExceededError" });
+    }
+    const journal = lsRead(JKEY, {}); journal[id] = { v, n }; lsWrite(JKEY, journal);
+    chain = chain.then(() => tx("decks", "readwrite", st => { if (v) st.put(v, id); else st.delete(id); }))
+      .then(() => { const j = lsRead(JKEY, {}); if (j[id] && j[id].n === n) { delete j[id]; if (Object.keys(j).length) lsWrite(JKEY, j); else { try { localStorage.removeItem(JKEY); } catch {} } } ok(); })
+      .catch(failed);
+  };
   return {
     kind: "local",
-    start(onDecks, onStats) {
-      const raw = read(KEY, {}), out = {};
-      for (const [id, v] of Object.entries(raw)) out[id] = v.cards && v.cards[0] && Array.isArray(v.cards[0]) ? deserialize(id, v) : deserialize(id, serialize(v));
-      onDecks(out, false); onStats(read(SKEY, { goal: 20, days: {} }));
+    get engine() { return idb ? "IndexedDB" : "localStorage"; },
+    async start(onDecks, onStats) {
+      idb = await openIdb();
+      let raw = {}, stats = null;
+      if (idb) {
+        try {
+          const keys = await tx("decks", "readonly", st => st.getAllKeys());
+          const vals = await tx("decks", "readonly", st => st.getAll());
+          (keys || []).forEach((k, i) => { raw[k] = vals[i]; });
+          stats = lsRead(SKEY, null) || await tx("meta", "readonly", st => st.get("stats"));
+          const journal = lsRead(JKEY, null);
+          if (journal) {
+            for (const [id, e] of Object.entries(journal)) { if (e.v) raw[id] = e.v; else delete raw[id]; }
+            await tx("decks", "readwrite", st => { for (const [id, e] of Object.entries(journal)) { if (e.v) st.put(e.v, id); else st.delete(id); } });
+            try { localStorage.removeItem(JKEY); } catch {}
+          }
+          const legacy = lsRead(KEY, null);
+          if (legacy && Object.keys(legacy).length) {
+            for (const [id, v] of Object.entries(legacy)) if (!raw[id]) raw[id] = v;
+            await tx("decks", "readwrite", st => { for (const [id, v] of Object.entries(legacy)) st.put(raw[id], id); });
+            try { localStorage.removeItem(KEY); } catch {}
+          }
+        } catch { idb = null; }
+      }
+      if (!idb) { raw = lsRead(KEY, {}); stats = lsRead(SKEY, null); }
+      try { if (navigator.storage && navigator.storage.persist) state.persisted = await navigator.storage.persist(); } catch {}
+      const out = {};
+      for (const [id, v] of Object.entries(raw)) if (v) out[id] = v.cards && v.cards[0] && Array.isArray(v.cards[0]) ? deserialize(id, v) : deserialize(id, serialize(v));
+      onDecks(out, false); onStats(stats || { goal: 20, days: {} });
     },
-    save(deck) { const all = read(KEY, {}); all[deck.id] = serialize(deck); if (!write(KEY, all)) setSync("Браузер не дал сохранить: закончилось место. Войдите в аккаунт, чтобы хранить большие колоды"); },
-    remove(id) { const all = read(KEY, {}); delete all[id]; write(KEY, all); },
-    saveStats(st) { write(SKEY, st); }
+    save(deck) { queue(deck.id, serialize(deck)); },
+    remove(id) { queue(id, null); },
+    saveStats(st) {
+      if (!lsWrite(SKEY, st) && !idb) failed({ name: "QuotaExceededError" });
+      if (idb) tx("meta", "readwrite", s2 => s2.put(st, "stats")).catch(() => {});
+    }
   };
 }
 
@@ -43,7 +98,7 @@ function makeDbStore(db, userId) {
     else if (left) setSync(left > 2 ? "Сохраняю… осталось частей: " + left : "Сохраняю…");
     else setSync("Сохранено");
   }
-  function enqueue(path, entry) { queue.delete(path); queue.set(path, entry); kick(900); }
+  function enqueue(path, entry) { queue.delete(path); queue.set(path, entry); kick(250); }
   function kick(delay) { if (!timer && !inflight) timer = setTimeout(work, delay); status(); }
   async function work() {
     timer = null;
@@ -150,18 +205,27 @@ function makeDbStore(db, userId) {
 function saveDeck(deck) { state.decks[deck.id] = deck; state.store.save(deck); }
 function saveStats() { state.store.saveStats(JSON.parse(JSON.stringify(state.stats))); }
 function createDeck(name, cards = []) {
-  const deck = { id: S.uid(), name, created: Date.now(), newPerDay: S.DEFAULT_NEW_PER_DAY, reverse: false, typeIn: false, newDay: "", newDone: 0, cards };
+  const deck = { id: S.uid(), name, created: Date.now(), newPerDay: S.DEFAULT_NEW_PER_DAY, reverse: false, typeIn: false, newDay: "", newDone: 0, revDay: "", revDone: 0, lang: guessLang(cards), opts: {}, cards };
   saveDeck(deck); return deck;
 }
 const deckList = () => Object.values(state.decks).sort((a, b) => a.created - b.created);
+function guessLang(cards) {
+  const sample = cards.slice(0, 40).map(c => c.f).join(" ").toLowerCase();
+  if (/[äöüß]/.test(sample) || /\b(der|die|das|und|nicht)\b/.test(sample)) return "de";
+  if (/\b(de|het|een|niet|ij)\b|ij/.test(sample) && !/\b(the|to)\b/.test(sample)) return "nl";
+  if (/[ñ¿¡]/.test(sample) || /\b(el|los|las|una)\b/.test(sample)) return "es";
+  if (/[àâçèêëîïôûùœ]/.test(sample) || /\b(le|la|les|une|est)\b/.test(sample)) return "fr";
+  return "en";
+}
 
 /* ---------- speech ---------- */
-function speak(text) {
+const TTS = { en: "en-US", nl: "nl-NL", de: "de-DE", fr: "fr-FR", es: "es-ES", it: "it-IT", pt: "pt-PT", sv: "sv-SE", pl: "pl-PL", tr: "tr-TR" };
+function speak(text, lang) {
   try {
     if (!("speechSynthesis" in window)) return;
     speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text);
-    u.lang = /[а-яё]/i.test(text) ? "ru-RU" : /[äöüß]/i.test(text) ? "de-DE" : /[ñ¿¡]/i.test(text) ? "es-ES" : /[àâçéèêëîïôûùœ]/i.test(text) ? "fr-FR" : /[぀-ヿ]/.test(text) ? "ja-JP" : /[一-鿿]/.test(text) ? "zh-CN" : /[가-힯]/.test(text) ? "ko-KR" : "en-US";
+    u.lang = lang && TTS[lang] && !/[а-яё]/i.test(text) ? TTS[lang] : /[а-яё]/i.test(text) ? "ru-RU" : /[äöüß]/i.test(text) ? "de-DE" : /[ñ¿¡]/i.test(text) ? "es-ES" : /[àâçéèêëîïôûùœ]/i.test(text) ? "fr-FR" : /[぀-ヿ]/.test(text) ? "ja-JP" : /[一-鿿]/.test(text) ? "zh-CN" : /[가-힯]/.test(text) ? "ko-KR" : "en-US";
     u.rate = 0.9; speechSynthesis.speak(u);
   } catch {}
 }
@@ -177,7 +241,7 @@ const I = {
 const SAMPLE = [["apple","яблоко"],["to borrow","брать взаймы"],["to lend","давать взаймы"],["although","хотя"],["to achieve","достигать"],["reliable","надёжный"],["to improve","улучшать"],["opportunity","возможность"],["to suggest","предлагать"],["enough","достаточно"],["to own","владеть"],["weather","погода"],["to remember","помнить"],["to forget","забывать"],["neighbour","сосед"],["to explain","объяснять"],["purpose","цель, назначение"],["to require","требовать"],["obvious","очевидный"],["to avoid","избегать"]];
 
 /* ---------- navigation ---------- */
-const TAB_OF = { home: "home", deck: "home", new: "home", import: "home", tests: "tests", testresult: "tests", progress: "progress" };
+const TAB_OF = { home: "home", deck: "home", new: "home", import: "home", dict: "dict", word: "dict", tests: "tests", testresult: "tests", progress: "progress" };
 function go(view) { state.view = view; render(); window.scrollTo(0, 0); }
 function render() {
   if (!state.ready) return;
@@ -193,6 +257,8 @@ function render() {
   if (v.name === "testrun" && state.test) return renderTestRun();
   if (v.name === "testresult" && state.test) return renderTestResult();
   if (v.name === "progress") return renderProgress();
+  if (v.name === "dict") return renderDict();
+  if (v.name === "word" && state.decks[v.deck] && state.decks[v.deck].cards.some(c => c.id === v.card)) return renderWord();
   state.view = { name: "home" }; renderHome();
 }
 tabs.addEventListener("click", e => { const b = e.target.closest("[data-tab]"); if (b) go({ name: b.dataset.tab }); });
@@ -208,6 +274,7 @@ function renderHome() {
   const qi = S.quoteIndex(now, state.quoteShift), [qt, qa] = S.QUOTES[qi];
   let html = "";
   if (state.flash && state.flash.until > now) html += `<p class="notice">${esc(state.flash.text)}</p>`;
+  if (state.storageError) html += `<p class="notice warn"><b>Изменения не сохраняются.</b> ${esc(state.storageError)} Скачайте резервную копию на вкладке «Прогресс», чтобы не потерять прогресс.</p>`;
   if (state.store.kind === "local") html += window.SlovnikCloud && window.SlovnikCloud.enabled
     ? `<div class="notice row between"><span>Вы без аккаунта: колоды хранятся только в этом браузере.</span><button class="btn" data-act="sign-in">Войти</button></div>`
     : window.claude ? `<p class="notice">Вы не вошли в аккаунт, поэтому колоды сохраняются только в этом браузере. Войдите в claude.ai, чтобы прогресс был на всех устройствах.</p>`
@@ -268,11 +335,12 @@ function renderDeck() {
   <div class="panel">
     <label>Название колоды<input id="dk-name" value="${esc(deck.name)}" maxlength="80"></label>
     <div class="row">
-      <label style="flex:1;min-width:130px">Новых слов в день<input id="dk-new" type="number" min="0" max="500" value="${deck.newPerDay ?? S.DEFAULT_NEW_PER_DAY}"></label>
-      <label style="flex:1;min-width:170px">Сторона вопроса<select id="dk-rev"><option value="0" ${deck.reverse ? "" : "selected"}>Слово → перевод</option><option value="1" ${deck.reverse ? "selected" : ""}>Перевод → слово</option></select></label>
+      <label style="flex:1;min-width:150px">Язык слов<select id="dk-lang">${Object.entries(S.LANG_RU).map(([k, v]) => `<option value="${k}" ${deck.lang === k ? "selected" : ""}>${v}</option>`).join("")}</select></label>
       <label style="flex:1;min-width:170px">Как отвечать<select id="dk-type"><option value="0" ${deck.typeIn ? "" : "selected"}>Вспомнить и проверить себя</option><option value="1" ${deck.typeIn ? "selected" : ""}>Вписать ответ</option></select></label>
     </div>
+    ${deckProgressHtml(deck, now)}
   </div>
+  ${optionsHtml(deck)}
   <form class="panel" id="addform"><h2>${editing ? "Изменить карточку" : "Добавить карточки"}</h2>
     ${editing ? `<label>Слово<textarea id="ed-f" style="min-height:60px">${esc(editing.f)}</textarea></label><label>Перевод<textarea id="ed-b" style="min-height:60px">${esc(editing.b)}</textarea></label><div class="row"><button class="btn" type="submit">Сохранить</button><button class="btn ghost" type="button" data-act="cancel-edit">Отмена</button></div>`
       : `<textarea id="add-words" placeholder="слово — перевод&#10;по одной паре на строку"></textarea><div class="row"><button class="btn" type="submit">Добавить</button><span class="muted small" id="add-count"></span></div>`}
@@ -287,8 +355,9 @@ function renderDeck() {
   if (qI) qI.addEventListener("input", () => { state.view.q = qI.value; state.view.limit = 100; document.getElementById("cl").innerHTML = cardListHtml(deck, Date.now()); });
   const nameI = document.getElementById("dk-name");
   nameI.addEventListener("change", () => { const n = nameI.value.trim(); if (n) { deck.name = n; saveDeck(deck); } });
-  document.getElementById("dk-new").addEventListener("change", e => { deck.newPerDay = Math.max(0, Math.min(500, parseInt(e.target.value, 10) || 0)); saveDeck(deck); });
-  document.getElementById("dk-rev").addEventListener("change", e => { deck.reverse = e.target.value === "1"; saveDeck(deck); });
+  document.getElementById("dk-new").addEventListener("change", e => { deck.newPerDay = Math.max(0, Math.min(9999, parseInt(e.target.value, 10) || 0)); saveDeck(deck); });
+  document.getElementById("dk-lang").addEventListener("change", e => { deck.lang = e.target.value; saveDeck(deck); });
+  document.getElementById("dk-opts").addEventListener("toggle", e => { state.optsOpen = e.target.open; });
   document.getElementById("dk-type").addEventListener("change", e => { deck.typeIn = e.target.value === "1"; saveDeck(deck); });
   const ta = document.getElementById("add-words");
   if (ta) ta.addEventListener("input", () => { const n = S.parseImport(ta.value).length; document.getElementById("add-count").textContent = n ? `Распознано: ${n}` : ""; });
@@ -303,6 +372,64 @@ function renderDeck() {
       deck.cards.push(...pairs.map(([f, b]) => newCard(f, b))); saveDeck(deck); render();
     }
   });
+}
+function deckProgressHtml(deck, now) {
+  const st = { new: 0, learn: 0, review: 0, known: 0, sus: 0 }; let hard = 0;
+  for (const c of deck.cards) { st[S.wordStatus(c)]++; if (S.isHard(c)) hard++; }
+  const total = deck.cards.length || 1, pct = k => (st[k] / total * 100).toFixed(2);
+  return `<div class="stackbar" role="img" aria-label="Знаю ${st.known}, повторяю ${st.review}, изучаю ${st.learn}, новых ${st.new}"><i class="sb-known" style="width:${pct("known")}%"></i><i class="sb-review" style="width:${pct("review")}%"></i><i class="sb-learn" style="width:${pct("learn")}%"></i></div>
+    <div class="legend-row small"><span><i class="dot sb-known"></i>Знаю ${st.known}</span><span><i class="dot sb-review"></i>Повторяю ${st.review}</span><span><i class="dot sb-learn"></i>Изучаю ${st.learn}</span><span><i class="dot sb-new"></i>Новых ${st.new}</span>${hard ? `<span>Трудных ${hard}</span>` : ""}${st.sus ? `<span>Приостановлено ${st.sus}</span>` : ""}</div>`;
+}
+const sel = (key, val, list) => `<select data-opt="${key}">${list.map(([v, t]) => `<option value="${v}" ${String(val) === String(v) ? "selected" : ""}>${t}</option>`).join("")}</select>`;
+function optionsHtml(deck) {
+  const o = S.deckOpts(deck);
+  return `<details class="panel opts" id="dk-opts" ${state.optsOpen ? "open" : ""}><summary><span><b>Параметры изучения</b><br><span class="muted small">Порядок слов, лимиты, шаги, алгоритм: ${o.newOrder === "random" ? "вразброс" : o.newOrder === "reverse" ? "с конца" : "по порядку"}, ${o.algo === "fsrs" ? "FSRS" : "SM-2"}</span></span></summary>
+  <div class="optgrid">
+    <fieldset><legend>Порядок показа</legend>
+      <label>Новые слова${sel("newOrder", o.newOrder, [["seq", "По порядку, как в списке"], ["random", "Вразброс"], ["reverse", "С конца списка"]])}</label>
+      <label>Повторения${sel("revOrder", o.revOrder, [["due", "Сначала самые просроченные"], ["random", "Вразброс"]])}</label>
+      <label>Новые и повторения${sel("mix", o.mix, [["mix", "Вперемешку"], ["rev_first", "Сначала повторения"], ["new_first", "Сначала новые"]])}</label>
+      <label>Сторона вопроса${sel("dir", o.dir, [["fwd", "Слово → перевод"], ["rev", "Перевод → слово"], ["both", "В обе стороны, вразброс"]])}</label>
+    </fieldset>
+    <fieldset><legend>Лимиты на день</legend>
+      <label>Новых слов<input id="dk-new" type="number" min="0" max="9999" value="${deck.newPerDay ?? S.DEFAULT_NEW_PER_DAY}"></label>
+      <label>Повторений, не больше<input data-opt="maxRev" type="number" min="0" max="9999" value="${o.maxRev}"></label>
+    </fieldset>
+    <fieldset><legend>Шаги изучения</legend>
+      <label>Для нового слова<input data-opt="steps" value="${S.fmtSteps(o.steps)}" placeholder="1м 10м"></label>
+      <label>После ошибки в повторении<input data-opt="relearn" value="${S.fmtSteps(o.relearn)}" placeholder="10м"></label>
+      <p class="muted small">Через сколько слово вернётся, пока не перейдёт в долгие повторения. Пишите через пробел: <code>1м 10м 1ч 1д</code>. Пусто: слово сразу уходит в повторения.</p>
+      <label class="check"><input type="checkbox" data-opt="learnAhead" ${o.learnAhead ? "checked" : ""}>Показывать изучаемые слова раньше срока, если больше нечего учить</label>
+    </fieldset>
+    <fieldset><legend>Алгоритм интервалов</legend>
+      <label>Алгоритм${sel("algo", o.algo, [["sm2", "SM-2, классический Anki"], ["fsrs", "FSRS, как в новом Anki"]])}</label>
+      ${o.algo === "fsrs" ? `<label>Желаемая запоминаемость, %<input data-opt="retention" type="number" min="70" max="99" value="${Math.round(o.retention * 100)}"></label>
+        <p class="muted small">FSRS ставит повтор на момент, когда вы с этой вероятностью ещё помните слово. 90% подходит большинству. Выше — больше повторений, ниже — меньше, но больше забывания.</p>`
+      : `<label>Первый интервал после «Хорошо», дней<input data-opt="gradIvl" type="number" min="1" max="365" value="${o.gradIvl}"></label>
+        <label>После «Легко», дней<input data-opt="easyIvl" type="number" min="1" max="365" value="${o.easyIvl}"></label>`}
+      <label>Максимальный интервал, дней<input data-opt="maxIvl" type="number" min="1" max="36500" value="${o.maxIvl}"></label>
+    </fieldset>
+    <fieldset><legend>Трудные слова</legend>
+      <label>Считать трудным после ошибок<input data-opt="leech" type="number" min="2" max="99" value="${o.leech}"></label>
+      <label>Что делать с трудным словом${sel("leechAction", o.leechAction, [["flag", "Только отметить"], ["suspend", "Убрать из повторений"]])}</label>
+    </fieldset>
+  </div>
+  <p class="small" id="opts-msg" hidden></p>
+  <div class="row"><button class="chip" data-act="opts-all">Применить ко всем колодам</button><button class="chip" data-act="opts-reset">Вернуть по умолчанию</button></div>
+  </details>`;
+}
+function setOpt(deck, key, el) {
+  const msg = document.getElementById("opts-msg");
+  const say = (t, bad) => { if (msg) { msg.hidden = false; msg.textContent = t; msg.style.color = bad ? "var(--again)" : ""; } };
+  let v;
+  if (key === "steps" || key === "relearn") { v = S.parseSteps(el.value); if (!v) return say("Не понял шаги. Пример: 1м 10м 1д", true); }
+  else if (el.type === "checkbox") v = el.checked;
+  else if (el.type === "number") { v = parseFloat(el.value); if (!Number.isFinite(v)) return say("Введите число", true); if (key === "retention") v = Math.min(99, Math.max(70, v)) / 100; }
+  else v = el.value;
+  deck.opts = { ...(deck.opts || {}), [key]: v };
+  if (key === "dir") deck.reverse = v === "rev";
+  saveDeck(deck); say("Сохранено");
+  if (key === "algo") render();
 }
 function cardListHtml(deck, now) {
   if (!deck.cards.length) return `<p class="muted">В колоде пока нет карточек.</p>`;
@@ -465,7 +592,9 @@ function renderImport() {
   }
 }
 app.addEventListener("change", e => {
-  const t = e.target, kind = t.dataset && t.dataset.imp; if (!kind || !state.imp) return;
+  const t = e.target;
+  if (t.dataset && t.dataset.opt && state.view.name === "deck") { setOpt(state.decks[state.view.deck], t.dataset.opt, t); return; }
+  const kind = t.dataset && t.dataset.imp; if (!kind || !state.imp) return;
   const imp = state.imp, gi = +t.dataset.g, mp = imp.maps[gi];
   if (kind === "front") { mp.front = +t.value; mp.back = mp.back.filter(i => i !== mp.front); if (!mp.back.length) { const o = imp.groups[gi].fieldNames.findIndex((_, i) => i !== mp.front); if (o >= 0) mp.back = [o]; } }
   else if (kind === "back") { const i = +t.dataset.i; mp.back = t.checked ? [...mp.back, i].sort((a, b) => a - b) : mp.back.filter(x => x !== i); }
@@ -497,31 +626,38 @@ function doImport() {
 
 /* ---------- study ---------- */
 function renderStudy() {
-  const deck = state.decks[state.view.deck], now = Date.now();
-  const locked = state.view.lock && deck.cards.find(x => x.id === state.view.lock);
-  const card = locked || nextCard(deck, now), c = counts(deck, now);
+  const deck = state.decks[state.view.deck], now = Date.now(), o = S.deckOpts(deck);
+  const locked = state.view.lock && deck.cards.find(x => x.id === state.view.lock && !x.sus);
+  let card = locked || nextCard(deck, now);
+  if (!card && state.view.ahead) card = S.earliestLearning(deck);
+  const c = counts(deck, now);
   if (!card) {
-    const nd = nextLearnDue(deck), td = todayStats();
+    const nd = nextLearnDue(deck), td = todayStats(), mins = nd ? Math.max(1, Math.round((nd - now) / 60000)) : 0;
+    const sameDay = nd && nd < dayStart(now) + DAY;
+    const left = c.newTotal - c.n;
     app.innerHTML = `<div class="row"><button class="chip" data-act="home">← Колоды</button></div>
-      <div class="panel done"><div class="big">На сегодня всё</div>
-      <p class="muted">Сегодня ${td.r || 0} ${plural(td.r || 0, "ответ", "ответа", "ответов")}. ${nd ? `Следующая карточка на изучении появится в ${new Date(nd).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}.` : "Повторения уже запланированы на следующие дни."}</p>
-      <div class="row" style="justify-content:center">${deck.cards.length >= 4 ? `<button class="btn ghost" data-act="quick-test" data-id="${deck.id}">Пройти тест</button>` : ""}<button class="btn ghost" data-act="deck" data-id="${deck.id}">Добавить слова</button><button class="btn" data-act="home">К колодам</button></div></div>`;
+      <div class="panel done"><div class="big">${sameDay ? "Пауза для памяти" : "На сегодня всё"}</div>
+      <p class="muted">${sameDay ? `Слова на изучении вернутся через ${mins} мин: короткий перерыв помогает запомнить их надёжнее.` : `Сегодня ${td.r || 0} ${plural(td.r || 0, "ответ", "ответа", "ответов")}. Следующие повторения уже запланированы.`}</p>
+      ${!sameDay && left > 0 ? `<p class="small muted">Новых слов на сегодня больше нет: лимит ${deck.newPerDay} в день. Ещё ${left} ждут своей очереди. Лимит меняется в «Параметрах изучения».</p>` : ""}
+      <div class="row" style="justify-content:center">${sameDay ? `<button class="btn" data-act="study-ahead">Повторить сейчас</button>` : ""}${!sameDay && left > 0 ? `<button class="btn" data-act="more-new" data-id="${deck.id}">Ещё 10 новых слов</button>` : ""}${deck.cards.length >= 4 ? `<button class="btn ghost" data-act="quick-test" data-id="${deck.id}">Пройти тест</button>` : ""}<button class="btn ghost" data-act="home">К колодам</button></div></div>`;
     state.view.card = null; return;
   }
   if (state.view.card !== card.id) { state.view.card = card.id; state.view.typed = null; }
   state.view.lock = card.id;
-  const q = deck.reverse ? card.b : card.f, a = deck.reverse ? card.f : card.b;
+  const rev = S.cardDirection(deck, card) === "rev";
+  const q = rev ? card.b : card.f, a = rev ? card.f : card.b;
   const shown = !!state.view.shown;
-  const opts = [1, 2, 3, 4].map(r => fmtInterval(schedule(card, r, now, true), now));
+  const opts = [1, 2, 3, 4].map(r => fmtInterval(schedule(card, r, now, true, o), now));
   const kind = card.s === 0 ? "c-new" : card.s === 2 ? "c-due" : "c-learn";
   const typed = state.view.typed;
   const verdict = typed != null ? checkAnswer(typed, a) : null;
+  const nth = card.s === 0 ? `Новое слово · ${deck.cards.filter(x => x.s !== 0).length + 1}-е из ${deck.cards.length}` : card.s === 2 ? `Повторение · ${card.reps} ${plural(card.reps, "раз", "раза", "раз")}` : "Изучаю";
   app.innerHTML = `<div class="study-top"><button class="chip" data-act="home">← ${esc(deck.name)}</button>
-    <div class="row" style="gap:12px">${state.undo && state.undo.deck === deck.id ? `<button class="chip" data-act="undo">Отменить ответ</button>` : ""}<div class="counts"><span class="c-new">${c.n}</span><span class="c-learn">${c.l}</span><span class="c-due">${c.r}</span></div></div></div>
+    <div class="row" style="gap:12px">${state.undo && state.undo.deck === deck.id ? `<button class="chip" data-act="undo">Отменить ответ</button>` : ""}<div class="counts" title="Новые / Изучаю / Повтор"><span class="c-new">${c.n}</span><span class="c-learn">${c.l}</span><span class="c-due">${c.r}</span></div></div></div>
     <div class="scene"><div class="card ${shown ? "flip" : ""}" aria-live="polite">
-      <span class="tag ${kind}">${card.s === 0 ? "Новое слово" : card.s === 2 ? "Повторение" : "Изучаю"}</span>
+      <span class="tag ${kind}">${nth}${card.flag ? " · ★ трудное" : ""}</span>
       <div class="face">${esc(q)}</div>
-      <button class="speak" data-act="speak" data-text="${esc(card.f)}" aria-label="Произнести слово">${I.speak}</button>
+      ${rev && !shown ? "" : `<button class="speak" data-act="speak" data-text="${esc(card.f)}" aria-label="Произнести слово">${I.speak}</button>`}
       ${shown ? `<hr>${verdict ? `<div class="typed ${verdict}">${verdict === "wrong" ? "Ваш ответ: " + esc(typed || "—") : verdict === "typo" ? "Почти верно: " + esc(typed) : "Верно!"}</div>` : ""}<div class="back">${esc(a)}</div>` : ""}
     </div></div>
     ${shown ? `<div class="answers">
@@ -529,6 +665,7 @@ function renderStudy() {
       <button class="ans a2" data-act="rate" data-r="2">Трудно<span>${opts[1]}</span></button>
       <button class="ans a3" data-act="rate" data-r="3">Хорошо<span>${opts[2]}</span></button>
       <button class="ans a4" data-act="rate" data-r="4">Легко<span>${opts[3]}</span></button></div>
+      <div class="row" style="justify-content:center;gap:8px"><button class="chip" data-act="word-from-study">Формы и примеры</button><button class="chip" data-act="flag-card">${card.flag ? "Снять «трудное»" : "★ Трудное"}</button><button class="chip" data-act="suspend-card">Не показывать</button></div>
       <p class="kbd">Клавиши 1–4 для ответа${verdict === "wrong" ? ". Совет: при ошибке нажмите «Снова»" : ""}</p>`
     : deck.typeIn ? `<form id="type-form" class="row" style="flex-wrap:nowrap"><input id="type-in" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Ваш ответ" style="flex:1;min-width:0"><button class="btn" type="submit">Проверить</button></form><p class="kbd">Enter — проверить</p>`
     : `<button class="btn show" data-act="show">Показать ответ</button><p class="kbd">Пробел — показать ответ</p>`}`;
@@ -541,22 +678,217 @@ function renderStudy() {
 function rate(r) {
   const deck = state.decks[state.view.deck]; if (!deck) return;
   const idx = deck.cards.findIndex(c => c.id === state.view.card); if (idx < 0) return;
-  const old = deck.cards[idx], now = Date.now();
-  state.undo = { deck: deck.id, idx, card: old, newDay: deck.newDay, newDone: deck.newDone, stats: JSON.stringify(state.stats) };
-  const wasNew = old.s === 0;
-  if (wasNew) { const tk = dayKey(now); if (deck.newDay !== tk) { deck.newDay = tk; deck.newDone = 0; } deck.newDone++; }
-  deck.cards[idx] = schedule(old, r, now, false);
-  S.bump(state.stats, now, { r: 1, n: wasNew ? 1 : 0, rv: old.s === 2 ? 1 : 0, ok: old.s === 2 && r > 1 ? 1 : 0 });
+  const old = deck.cards[idx], now = Date.now(), o = S.deckOpts(deck), tk = dayKey(now);
+  state.undo = { deck: deck.id, idx, card: old, newDay: deck.newDay, newDone: deck.newDone, revDay: deck.revDay, revDone: deck.revDone, stats: JSON.stringify(state.stats) };
+  const wasNew = old.s === 0, wasReview = old.s === 2;
+  if (wasNew) { if (deck.newDay !== tk) { deck.newDay = tk; deck.newDone = 0; } deck.newDone++; }
+  if (wasReview) { if (deck.revDay !== tk) { deck.revDay = tk; deck.revDone = 0; } deck.revDone = (deck.revDone || 0) + 1; }
+  const next = schedule(old, r, now, false, o);
+  if (wasReview && r === 1 && next.lapses >= o.leech && (next.lapses - o.leech) % Math.max(1, Math.ceil(o.leech / 2)) === 0) {
+    next.flag = 1; if (o.leechAction === "suspend") next.sus = 1;
+    state.flash = { until: now + 12000, text: `«${old.f}» часто забывается: слово отмечено как трудное${o.leechAction === "suspend" ? " и убрано из повторений" : ""}. Загляните в «Словарь», чтобы разобрать его с примерами.` };
+  }
+  deck.cards[idx] = next;
+  S.bump(state.stats, now, { r: 1, n: wasNew ? 1 : 0, rv: wasReview ? 1 : 0, ok: wasReview && r > 1 ? 1 : 0 });
   saveDeck(deck); saveStats();
-  state.view.shown = false; state.view.typed = null; state.view.lock = null; render();
+  state.view.shown = false; state.view.typed = null; state.view.lock = null; state.view.ahead = false; render();
 }
 function undo() {
   const u = state.undo, deck = u && state.decks[u.deck]; if (!deck) return;
-  deck.cards[u.idx] = u.card; deck.newDay = u.newDay; deck.newDone = u.newDone;
+  deck.cards[u.idx] = u.card; deck.newDay = u.newDay; deck.newDone = u.newDone; deck.revDay = u.revDay; deck.revDone = u.revDone;
   state.stats = JSON.parse(u.stats); state.undo = null;
   saveDeck(deck); saveStats();
   state.view.card = u.card.id; state.view.lock = u.card.id; state.view.shown = false; state.view.typed = null;
   render();
+}
+function updateCard(deckId, cardId, patch) {
+  const d = state.decks[deckId], i = d ? d.cards.findIndex(c => c.id === cardId) : -1; if (i < 0) return null;
+  const c = { ...d.cards[i], ...patch };
+  for (const k of Object.keys(patch)) if (patch[k] === undefined) delete c[k];
+  d.cards[i] = c; saveDeck(d); return c;
+}
+
+/* ---------- dictionary ---------- */
+const STATUS_RU = { new: "новое", learn: "изучаю", review: "повторяю", known: "знаю", sus: "приостановлено" };
+function dictRows() {
+  const f = state.dictF || (state.dictF = { q: "", status: "all", deck: "all", sort: "alpha", limit: 100 });
+  const q = S.normalize(f.q);
+  let rows = [];
+  for (const d of deckList()) {
+    if (f.deck !== "all" && d.id !== f.deck) continue;
+    for (const c of d.cards) {
+      const st = S.wordStatus(c);
+      if (f.status === "hard" ? !S.isHard(c) : f.status !== "all" && st !== f.status) continue;
+      if (q && !S.normalize(c.f).includes(q) && !S.normalize(c.b).includes(q)) continue;
+      rows.push({ c, d, st });
+    }
+  }
+  const coll = new Intl.Collator("ru", { sensitivity: "base" });
+  if (f.sort === "alpha") rows.sort((a, b) => coll.compare(a.c.f, b.c.f));
+  else if (f.sort === "due") rows.sort((a, b) => (a.c.s === 0 ? Infinity : a.c.due) - (b.c.s === 0 ? Infinity : b.c.due));
+  else if (f.sort === "lapses") rows.sort((a, b) => (b.c.lapses || 0) - (a.c.lapses || 0));
+  else if (f.sort === "recall") rows.sort((a, b) => (S.recallChance(a.c) ?? 2) - (S.recallChance(b.c) ?? 2));
+  return rows;
+}
+function dueText(c, now) {
+  if (c.sus) return "не показывается";
+  if (c.s === 0) return "ещё не изучали";
+  if (S.isLearning(c)) return c.due <= now ? "сейчас" : "сегодня";
+  const d = Math.round((c.due - dayStart(now)) / DAY);
+  return d <= 0 ? "сегодня" : d === 1 ? "завтра" : "через " + d + " " + plural(d, "день", "дня", "дней");
+}
+function dictListHtml() {
+  const f = state.dictF, rows = dictRows(), now = Date.now();
+  if (!rows.length) return `<p class="muted">${deckList().length ? "Ничего не нашлось. Измените поиск или фильтр." : "Слов пока нет: создайте или импортируйте колоду."}</p>`;
+  return `<p class="small muted">${rows.length} ${plural(rows.length, "слово", "слова", "слов")}</p><div class="dict">${rows.slice(0, f.limit).map(({ c, d, st }) => `
+    <button class="dict-row" data-act="open-word" data-deck="${d.id}" data-id="${c.id}">
+      <span class="dw"><b>${esc(c.f)}</b>${c.flag ? ' <span class="star" aria-label="трудное">★</span>' : ""}<span class="muted">${esc(String(c.b).split("\n")[0])}</span></span>
+      <span class="dm"><span class="pill st-${st}">${STATUS_RU[st]}</span><span class="small muted">${dueText(c, now)}</span></span>
+    </button>`).join("")}</div>
+    ${rows.length > f.limit ? `<button class="btn ghost" data-act="dict-more">Показать ещё (${Math.min(100, rows.length - f.limit)} из ${rows.length - f.limit})</button>` : ""}`;
+}
+function renderDict() {
+  const decks = deckList(); dictRows();
+  const f = state.dictF;
+  const all = decks.flatMap(d => d.cards), cnt = { new: 0, learn: 0, review: 0, known: 0, sus: 0 }; let hard = 0;
+  for (const c of all) { cnt[S.wordStatus(c)]++; if (S.isHard(c)) hard++; }
+  const chip = (v, t, n) => `<button class="chip ${f.status === v ? "on" : ""}" data-act="dict-status" data-id="${v}">${t}${n !== undefined ? ` <span class="cnt">${n}</span>` : ""}</button>`;
+  app.innerHTML = `<h1>Словарь</h1>
+  <p class="muted">Все ваши слова: что уже знаете, что повторяете, что ещё впереди. Нажмите на слово, чтобы увидеть примеры, формы и прогресс.</p>
+  <div class="panel">
+    <input id="dict-q" type="search" placeholder="Поиск по слову или переводу" value="${esc(f.q)}">
+    <div class="row" style="gap:6px">${chip("all", "Все", all.length)}${chip("known", "Знаю", cnt.known)}${chip("review", "Повторяю", cnt.review)}${chip("learn", "Изучаю", cnt.learn)}${chip("new", "Новые", cnt.new)}${chip("hard", "★ Трудные", hard)}${cnt.sus ? chip("sus", "Приостановлены", cnt.sus) : ""}</div>
+    <div class="row">
+      ${decks.length > 1 ? `<label style="flex:1;min-width:150px">Колода<select id="dict-deck"><option value="all">Все колоды</option>${decks.map(d => `<option value="${d.id}" ${f.deck === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("")}</select></label>` : ""}
+      <label style="flex:1;min-width:150px">Сортировка<select id="dict-sort">${[["alpha", "По алфавиту"], ["due", "По следующему повтору"], ["recall", "Сначала забываемые"], ["lapses", "По числу ошибок"]].map(([v, t]) => `<option value="${v}" ${f.sort === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>
+    </div>
+  </div>
+  <div id="dict-list">${dictListHtml()}</div>`;
+  const qI = document.getElementById("dict-q");
+  qI.addEventListener("input", () => { f.q = qI.value; f.limit = 100; document.getElementById("dict-list").innerHTML = dictListHtml(); });
+  const dk = document.getElementById("dict-deck"); if (dk) dk.addEventListener("change", e => { f.deck = e.target.value; f.limit = 100; render(); });
+  document.getElementById("dict-sort").addEventListener("change", e => { f.sort = e.target.value; render(); });
+}
+function fmtDate(t) { return new Date(t).toLocaleDateString("ru-RU", { day: "numeric", month: "long", year: new Date(t).getFullYear() === new Date().getFullYear() ? undefined : "numeric" }); }
+function renderWord() {
+  const v = state.view, deck = state.decks[v.deck], c = deck.cards.find(x => x.id === v.card), now = Date.now();
+  const st = S.wordStatus(c), r = S.recallChance(c, now);
+  const lines = String(c.b).split("\n"), main = lines[0], extra = lines.slice(1).join("\n");
+  const back = v.from === "study" ? `<button class="chip" data-act="back-study">← К учёбе</button>` : `<button class="chip" data-act="back-dict">← Словарь</button>`;
+  app.innerHTML = `<div class="row between">${back}<span class="small muted">${esc(deck.name)}</span></div>
+  <section class="panel word-head">
+    <div class="row between" style="align-items:flex-start;flex-wrap:nowrap"><div style="min-width:0"><h1 class="word-title">${esc(c.f)}</h1><p class="word-tr">${esc(main)}</p></div>
+    <button class="speak" data-act="speak" data-text="${esc(c.f)}" aria-label="Произнести">${I.speak}</button></div>
+    ${extra ? `<p class="word-extra">${esc(extra)}</p>` : ""}
+    <div class="row" style="gap:6px"><span class="pill st-${st}">${STATUS_RU[st]}</span>${c.flag ? `<span class="pill st-hard">★ трудное</span>` : ""}</div>
+  </section>
+  <section class="tiles">
+    <div class="tile"><b>${c.reps || 0}</b><span>${plural(c.reps || 0, "повторение", "повторения", "повторений")}</span></div>
+    <div class="tile"><b>${c.lapses || 0}</b><span>${plural(c.lapses || 0, "ошибка", "ошибки", "ошибок")} в повторах</span></div>
+    <div class="tile"><b>${c.s === 2 ? c.ivl + " д" : "—"}</b><span>текущий интервал</span></div>
+    <div class="tile"><b>${r === null ? "—" : Math.round(r * 100) + "%"}</b><span>вероятность вспомнить сейчас</span></div>
+  </section>
+  <p class="small muted">${c.s === 0 ? "Слово ещё не изучали." : `Следующее повторение: <b>${c.s === 2 ? fmtDate(c.due) : "сегодня"}</b> (${dueText(c, now)}).${c.intro ? " Начали учить " + fmtDate(c.intro) + "." : ""}`}</p>
+  <div class="row" style="gap:8px">
+    <button class="chip" data-act="w-flag">${c.flag ? "Снять «трудное»" : "★ Отметить трудным"}</button>
+    <button class="chip" data-act="w-sus">${c.sus ? "Вернуть в повторения" : "Не показывать"}</button>
+    ${c.s === 2 && c.due > dayStart(now) + DAY ? `<button class="chip" data-act="w-today">Повторить сегодня</button>` : ""}
+    ${c.s !== 0 ? `<button class="chip" data-act="w-reset">Учить заново</button>` : ""}
+    <button class="chip" data-act="w-edit">Изменить</button>
+  </div>
+  <div id="w-reset-zone"></div>
+  ${formsHtml(deck, c)}
+  <section class="panel" id="wikt"><h2>Значения и примеры</h2><div id="wikt-body">${wiktPlaceholder(deck, c)}</div></section>`;
+  loadWiktionary(deck, c);
+}
+function formsHtml(deck, c) {
+  if ((deck.lang || "en") !== "en") return "";
+  const asVerb = state.view.asVerb ?? S.looksLikeVerb(c);
+  if (!asVerb) {
+    const pl = !/\s/.test(c.f.trim()) ? S.englishPlural(c.f) : null;
+    return `<section class="panel"><div class="row between"><h2>Формы слова</h2><button class="chip" data-act="w-verb">Это глагол: показать времена</button></div>
+      ${pl ? `<p>Множественное число: <b>${esc(pl.plural)}</b>${pl.irregular ? " (исключение)" : ""}</p><p class="small muted">Если это прилагательное или наречие, множественного числа у него нет.</p>` : `<p class="muted small">Для фраз формы не строятся.</p>`}</section>`;
+  }
+  const v = S.englishVerb(c.f, c.b);
+  if (!v) return "";
+  if (v.modal) return `<section class="panel"><h2>Формы слова</h2><p>«${esc(v.base)}» — модальный глагол: он не изменяется по лицам и временам, а после него глагол идёт без «to»: <i>I ${esc(v.base)} go</i>.</p></section>`;
+  const kind = state.view.formKind || "aff";
+  const seg = (k, t) => `<button class="chip ${kind === k ? "on" : ""}" data-act="w-kind" data-id="${k}">${t}</button>`;
+  return `<section class="panel"><div class="row between"><h2>Формы глагола</h2><button class="chip" data-act="w-noverb">Это не глагол</button></div>
+    <div class="vforms"><div><span class="muted small">Инфинитив</span><b>to ${esc(v.base + v.tail)}</b></div><div><span class="muted small">Прошедшее (V2)</span><b>${esc(v.past)}</b></div><div><span class="muted small">Причастие (V3)</span><b>${esc(v.pp)}</b></div><div><span class="muted small">-ing форма</span><b>${esc(v.ing)}</b></div></div>
+    <p class="small muted">${v.irregular ? "Неправильный глагол: формы V2 и V3 нужно запомнить." : "Правильный глагол: прошедшее время образуется окончанием -ed."}</p>
+    <div class="row" style="gap:6px">${seg("aff", "Утверждение")}${seg("neg", "Отрицание")}${seg("q", "Вопрос")}</div>
+    ${v.groups.map(g => `<h3 class="tgroup">${g.name}</h3><div class="tenses">${g.tenses.map(t => { const fm = t.forms(kind); return `<div class="tense"><div class="tname"><b>${t.name}</b><span class="small muted">${t.ru}</span></div><div class="tforms">${fm.map(x => `<span>${esc(x)}</span>`).join("")}</div><div class="small muted">Маркеры: ${t.hint}</div></div>`; }).join("")}</div>`).join("")}
+  </section>`;
+}
+const WIKT_UA = "Slovnik/1.0 (personal flashcard app)";
+function wiktPlaceholder(deck, c) {
+  if (window.claude) return `<p class="muted small">Значения и примеры из Викисловаря доступны в версии-сайте Словника: здесь браузер не пускает приложение в интернет.</p>`;
+  return `<div class="row"><div class="spinner" aria-hidden="true"></div><span class="muted small">Загружаю из Викисловаря…</span></div>`;
+}
+function wiktCacheGet(k) { try { const v = JSON.parse(localStorage.getItem("wikt:" + k) || "null"); return v && Date.now() - v.t < 30 * DAY ? v.d : null; } catch { return null; } }
+function wiktCacheSet(k, d) { try { localStorage.setItem("wikt:" + k, JSON.stringify({ t: Date.now(), d })); } catch {} }
+async function loadWiktionary(deck, c) {
+  if (window.claude) return;
+  const body = () => document.getElementById("wikt-body");
+  const lang = deck.lang && deck.lang !== "other" ? deck.lang : "en";
+  const word = S.lookupWord(c), key = lang + ":" + word, viewCard = c.id;
+  const stillHere = () => state.view.name === "word" && state.view.card === viewCard && body();
+  const link = `https://en.wiktionary.org/wiki/${encodeURIComponent(word.replace(/ /g, "_"))}${S.LANGS[lang] ? "#" + S.LANGS[lang] : ""}`;
+  if (!word) { if (stillHere()) body().innerHTML = `<p class="muted small">Для этой карточки нечего искать.</p>`; return; }
+  let data = wiktCacheGet(key);
+  if (!data) {
+    try {
+      const opt = { headers: { "Api-User-Agent": WIKT_UA } };
+      const [defRes, htmlRes] = await Promise.all([
+        fetch("https://en.wiktionary.org/api/rest_v1/page/definition/" + encodeURIComponent(word.replace(/ /g, "_")), opt),
+        fetch("https://en.wiktionary.org/api/rest_v1/page/html/" + encodeURIComponent(word.replace(/ /g, "_")), opt)
+      ]);
+      if (defRes.status === 404) data = { defs: [], tables: [], heads: [] };
+      else if (!defRes.ok) throw new Error("status " + defRes.status);
+      else {
+        const defs = S.parseWiktDefinitions(await defRes.json(), lang);
+        const page = htmlRes.ok ? extractInflection(await htmlRes.text(), S.LANGS[lang] || "English") : { tables: [], heads: [] };
+        data = { defs, tables: page.tables, heads: page.heads };
+      }
+      wiktCacheSet(key, data);
+    } catch (e) {
+      if (stillHere()) body().innerHTML = `<p class="muted small">Не удалось загрузить: ${navigator.onLine === false ? "нет интернета" : "Викисловарь не ответил"}. <a href="${link}" target="_blank" rel="noopener">Открыть статью</a></p>`;
+      return;
+    }
+  }
+  if (!stillHere()) return;
+  if (!data.defs.length && !data.tables.length) { body().innerHTML = `<p class="muted small">В Викисловаре нет статьи «${esc(word)}» для языка «${esc(S.LANG_RU[lang] || lang)}». Проверьте язык колоды в её настройках.</p>`; return; }
+  body().innerHTML = `${data.heads.length ? `<p class="small">${data.heads.map(esc).join("<br>")}</p>` : ""}
+    ${data.defs.slice(0, 4).map(p => `<div class="pos"><span class="pill">${esc(p.posRu)}</span><ol>${p.defs.slice(0, 5).map(d => `<li>${esc(d.text)}${d.examples.slice(0, 2).map(x => `<div class="ex">${esc(x)}</div>`).join("")}</li>`).join("")}</ol></div>`).join("")}
+    ${data.tables.length ? `<h3>Таблица форм</h3>${data.tables.slice(0, 2).map(t => `<div class="wtable">${t}</div>`).join("")}` : ""}
+    <p class="small muted">Источник: <a href="${link}" target="_blank" rel="noopener">Викисловарь</a>, CC BY-SA. Определения на английском.</p>`;
+}
+const SAFE_CELL = new Set(["TABLE", "THEAD", "TBODY", "TR", "TH", "TD", "CAPTION", "BR"]);
+function cleanTable(node) {
+  const out = document.createElement(SAFE_CELL.has(node.tagName) ? node.tagName.toLowerCase() : "span");
+  for (const a of ["colspan", "rowspan"]) if (node.getAttribute && node.getAttribute(a)) out.setAttribute(a, node.getAttribute(a));
+  for (const ch of node.childNodes) {
+    if (ch.nodeType === 3) out.appendChild(document.createTextNode(ch.textContent));
+    else if (ch.nodeType === 1 && !/^(STYLE|SCRIPT|SUP|LINK|META|IMG|BUTTON)$/.test(ch.tagName) && !(ch.classList && (ch.classList.contains("reference") || ch.classList.contains("mw-editsection")))) out.appendChild(cleanTable(ch));
+  }
+  return out;
+}
+function extractInflection(html, langName) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const h2 = [...doc.querySelectorAll("h2")].find(h => h.textContent.replace(/\[edit\]/, "").trim() === langName);
+  if (!h2) return { tables: [], heads: [] };
+  let scope = h2.closest("section");
+  if (!scope || scope.querySelectorAll("h2").length > 1) {
+    scope = doc.createElement("div");
+    let n = (h2.closest(".mw-heading") || h2).nextElementSibling;
+    while (n && !(n.tagName === "H2" || (n.querySelector && n.querySelector(":scope > h2")) || n.matches(".mw-heading2"))) { scope.appendChild(n.cloneNode(true)); n = n.nextElementSibling; }
+  }
+  const heads = [...scope.querySelectorAll(".headword-line")].map(x => x.textContent.replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 3);
+  const tables = [...scope.querySelectorAll("table.inflection-table, table.inflection, .NavFrame table, table.wikitable")]
+    .filter((t, i, all) => !all.some(o => o !== t && o.contains(t)))
+    .slice(0, 2).map(t => cleanTable(t).outerHTML);
+  return { tables, heads };
 }
 
 /* ---------- tests ---------- */
@@ -567,9 +899,9 @@ const MODES = [
 ];
 function renderTestSetup() {
   const decks = deckList();
-  const cfg = state.testCfg || (state.testCfg = { deck: "all", mode: "choice", dir: "fwd", count: 10 });
+  const cfg = state.testCfg || (state.testCfg = { deck: "all", mode: "choice", dir: "fwd", count: 10, source: "all", timed: false });
   if (cfg.deck !== "all" && !state.decks[cfg.deck]) cfg.deck = "all";
-  const pool = cfg.deck === "all" ? decks.flatMap(d => d.cards) : state.decks[cfg.deck].cards;
+  const pool = testPool(cfg).map(x => x.c);
   const mode = MODES.find(m => m.id === cfg.mode);
   if (!decks.length) { app.innerHTML = `<h1>Тесты</h1><div class="empty"><p class="muted">Сначала создайте или импортируйте колоду: тесты строятся из ваших слов.</p><div class="row"><button class="btn" data-act="import">Импорт файла</button><button class="btn ghost" data-act="sample">Пример колоды</button></div></div>`; return; }
   app.innerHTML = `<h1>Тесты</h1>
@@ -578,25 +910,36 @@ function renderTestSetup() {
   <div class="panel">
     <label>Колода<select id="t-deck"><option value="all">Все колоды</option>${decks.map(d => `<option value="${d.id}" ${cfg.deck === d.id ? "selected" : ""}>${esc(d.name)} (${d.cards.length})</option>`).join("")}</select></label>
     <div class="row"><span class="small muted">Направление:</span><button class="chip ${cfg.dir === "fwd" ? "on" : ""}" data-act="t-dir" data-id="fwd">Слово → перевод</button><button class="chip ${cfg.dir === "rev" ? "on" : ""}" data-act="t-dir" data-id="rev">Перевод → слово</button></div>
-    <div class="row"><span class="small muted">Вопросов:</span>${[10, 20, 30].map(n => `<button class="chip ${cfg.count === n ? "on" : ""}" data-act="t-count" data-id="${n}">${n}</button>`).join("")}</div>
+    <div class="row"><span class="small muted">Какие слова:</span>${[["all", "Все"], ["studied", "Уже изученные"], ["hard", "★ Трудные"]].map(([v, t]) => `<button class="chip ${(cfg.source || "all") === v ? "on" : ""}" data-act="t-source" data-id="${v}">${t}</button>`).join("")}</div>
+    <div class="row"><span class="small muted">Вопросов:</span>${[10, 20, 30, 50].map(n => `<button class="chip ${cfg.count === n ? "on" : ""}" data-act="t-count" data-id="${n}">${n}</button>`).join("")}</div>
+    ${cfg.mode === "choice" ? `<label class="check"><input type="checkbox" id="t-timed" ${cfg.timed ? "checked" : ""}>На скорость: 6 секунд на ответ</label>` : ""}
+    <p class="small muted">В тесты попадают все слова, кроме приостановленных. Трудные — отмеченные звёздочкой или с тремя и больше ошибками.</p>
     ${pool.length < mode.min ? `<p class="notice warn small">Для этого режима нужно хотя бы ${mode.min} ${plural(mode.min, "карточка", "карточки", "карточек")} в колоде.</p>` : ""}
     <button class="btn" data-act="t-start" ${pool.length < mode.min ? "disabled" : ""}>Начать тест</button>
   </div>`;
   document.getElementById("t-deck").addEventListener("change", e => { cfg.deck = e.target.value; render(); });
+  const tt = document.getElementById("t-timed"); if (tt) tt.addEventListener("change", e => { cfg.timed = e.target.checked; });
+}
+function testPool(cfg) {
+  const decks = deckList();
+  const pool = (cfg.deck === "all" ? decks : [state.decks[cfg.deck]]).flatMap(d => d.cards.filter(c => !c.sus).map(c => ({ c, d: d.id })));
+  if (cfg.source === "hard") return pool.filter(x => S.isHard(x.c));
+  if (cfg.source === "studied") return pool.filter(x => x.c.s !== 0);
+  return pool;
 }
 function startTest() {
-  const cfg = state.testCfg, decks = deckList();
-  const pool = (cfg.deck === "all" ? decks.flatMap(d => d.cards.map(c => ({ c, d: d.id }))) : state.decks[cfg.deck].cards.map(c => ({ c, d: cfg.deck })));
+  const cfg = state.testCfg;
+  const pool = testPool(cfg);
   const studied = shuffle(pool.filter(x => x.c.s !== 0)), fresh = shuffle(pool.filter(x => x.c.s === 0));
   const picked = [...studied, ...fresh].slice(0, Math.min(cfg.count, pool.length));
   const qa = x => cfg.dir === "fwd" ? { q: x.c.f, a: x.c.b } : { q: x.c.b, a: x.c.f };
   const items = shuffle(picked).map(x => ({ id: x.c.id, deck: x.d, ...qa(x) }));
-  const answersPool = [...new Set(pool.map(x => qa(x).a))];
+  const answersPool = [...new Set((cfg.source === "all" ? pool : testPool({ ...cfg, source: "all" })).map(x => qa(x).a))];
   if (cfg.mode === "choice") items.forEach(it => {
     const wrong = shuffle(answersPool.filter(a => a !== it.a)).slice(0, 3);
     it.options = shuffle([it.a, ...wrong]);
   });
-  state.test = { mode: cfg.mode, items, i: 0, results: [], started: Date.now(), picked: null, pairs: null };
+  state.test = { mode: cfg.mode, items, i: 0, results: [], started: Date.now(), picked: null, pairs: null, timed: cfg.mode === "choice" && !!cfg.timed };
   if (cfg.mode === "pairs") nextPairsRound();
   go({ name: "testrun" });
 }
@@ -614,7 +957,7 @@ function renderTestRun() {
     return;
   }
   const it = t.items[t.i], ans = t.answered;
-  let body = `<div class="card" style="min-height:190px"><span class="tag muted">${t.mode === "choice" ? "Выберите перевод" : "Напишите перевод"}</span><div class="face">${esc(it.q)}</div></div>`;
+  let body = `${t.timed && !ans ? `<div class="timer"><i id="t-timer"></i></div>` : ""}<div class="card" style="min-height:190px"><span class="tag muted">${t.mode === "choice" ? "Выберите перевод" : "Напишите перевод"}</span><div class="face">${esc(it.q)}</div></div>`;
   if (t.mode === "choice") {
     body += `<div class="options">${it.options.map((o, k) => {
       const cls = ans ? (o === it.a ? "right" : o === ans.given ? "wrong" : "") : "";
@@ -629,6 +972,15 @@ function renderTestRun() {
   const form = document.getElementById("t-form");
   if (form) { const inp = document.getElementById("t-input"); inp.focus(); form.addEventListener("submit", e => { e.preventDefault(); answerTyped(inp.value); }); }
   const nx = document.getElementById("t-next"); if (nx) nx.focus();
+  if (t.timed && !ans) {
+    const bar = document.getElementById("t-timer"), qi = t.i, startAt = Date.now(), LIMIT = 6000;
+    clearInterval(t.tick);
+    t.tick = setInterval(() => {
+      if (state.test !== t || t.i !== qi || t.answered) return clearInterval(t.tick);
+      const left = Math.max(0, 1 - (Date.now() - startAt) / LIMIT); if (bar) bar.style.width = left * 100 + "%";
+      if (left <= 0) { clearInterval(t.tick); t.answered = { given: "", ok: false, timeout: true }; record(false, "время вышло"); render(); }
+    }, 100);
+  }
 }
 function record(ok, given) {
   const t = state.test, it = t.items[t.i];
@@ -732,10 +1084,20 @@ function renderProgress() {
     <p class="muted small">Зрелых карточек (интервал от 3 недель): ${mature}. Такие слова уже держатся в долговременной памяти.</p></div>
   <div class="panel"><label>Цель дня, ответов<input id="goal" type="number" min="5" max="1000" value="${state.stats.goal || 20}"></label></div>
   <div class="panel"><div class="row between"><div><h3>Резервная копия</h3><p class="muted small">Все колоды с прогрессом в одном файле. Восстановить: «Колоды» → «Импорт файла».</p></div><button class="btn ghost" data-act="backup">Скачать</button></div><p class="small" id="backup-msg" hidden></p></div>
+  ${storagePanel()}
   ${accountPanel()}`;
   document.getElementById("goal").addEventListener("change", e => { state.stats.goal = Math.max(5, Math.min(1000, parseInt(e.target.value, 10) || 20)); saveStats(); });
 }
 
+function storagePanel() {
+  const st = state.store;
+  if (st.kind !== "local") return "";
+  const ios = /iP(hone|ad|od)/.test(navigator.userAgent), standalone = window.navigator.standalone || (window.matchMedia && matchMedia("(display-mode: standalone)").matches);
+  return `<div class="panel"><h3>Где хранятся колоды</h3>
+    <p class="small">В памяти этого браузера (${st.engine}). ${state.persisted ? "Браузер обещал не удалять эти данные при нехватке места." : "Браузер может удалить данные при нехватке места."}</p>
+    ${ios && !standalone ? `<p class="notice warn small">На iPhone Safari стирает данные сайтов, которые не открывали 7 дней. Установите Словник на экран «Домой» («Поделиться» → «На экран Домой») и учите оттуда: у приложения с экрана «Домой» данные не стираются. Колоды в Safari и на экране «Домой» хранятся раздельно: перенесите их резервной копией.</p>` : ""}
+  </div>`;
+}
 function accountPanel() {
   const C = window.SlovnikCloud; if (!C || !C.enabled) return "";
   const acc = C.account();
@@ -756,7 +1118,29 @@ app.addEventListener("click", e => {
     "next-quote": () => { state.quoteShift++; render(); },
     "study": () => go({ name: "study", deck: id, shown: false }), "deck": () => go({ name: "deck", deck: id }),
     "show": () => { state.view.shown = true; render(); }, "rate": () => rate(+b.dataset.r), "undo": undo,
-    "speak": () => speak(b.dataset.text), "export": exportDeck,
+    "speak": () => speak(b.dataset.text, (state.decks[state.view.deck] || {}).lang), "export": exportDeck,
+    "study-ahead": () => { state.view.ahead = true; render(); },
+    "more-new": () => { const d = state.decks[id], tk = dayKey(Date.now()); d.newDone = (d.newDay === tk ? d.newDone : 0) - 10; d.newDay = tk; saveDeck(d); render(); },
+    "flag-card": () => { const c = updateCard(state.view.deck, state.view.card, { flag: (state.decks[state.view.deck].cards.find(x => x.id === state.view.card) || {}).flag ? undefined : 1 }); if (c) render(); },
+    "suspend-card": () => { updateCard(state.view.deck, state.view.card, { sus: 1 }); state.view.shown = false; state.view.lock = null; state.flash = { until: Date.now() + 8000, text: "Слово больше не показывается. Вернуть его можно в «Словаре»." }; render(); },
+    "word-from-study": () => go({ name: "word", deck: state.view.deck, card: state.view.card, from: "study", backView: { ...state.view } }),
+    "back-study": () => { const bv = state.view.backView; go(bv || { name: "home" }); },
+    "back-dict": () => go({ name: "dict" }),
+    "open-word": () => go({ name: "word", deck: b.dataset.deck, card: id }),
+    "dict-status": () => { state.dictF.status = id; state.dictF.limit = 100; render(); },
+    "dict-more": () => { state.dictF.limit += 100; document.getElementById("dict-list").innerHTML = dictListHtml(); },
+    "w-flag": () => { const c = state.decks[state.view.deck].cards.find(x => x.id === state.view.card); updateCard(state.view.deck, c.id, { flag: c.flag ? undefined : 1 }); render(); },
+    "w-sus": () => { const c = state.decks[state.view.deck].cards.find(x => x.id === state.view.card); updateCard(state.view.deck, c.id, { sus: c.sus ? undefined : 1 }); render(); },
+    "w-today": () => { updateCard(state.view.deck, state.view.card, { due: dayStart(Date.now()) }); render(); },
+    "w-reset": () => { document.getElementById("w-reset-zone").innerHTML = `<div class="row notice"><span>Стереть прогресс по этому слову и учить его как новое?</span><button class="btn danger" data-act="w-reset-yes">Да</button><button class="btn ghost" data-act="w-reset-no">Отмена</button></div>`; },
+    "w-reset-no": () => { document.getElementById("w-reset-zone").innerHTML = ""; },
+    "w-reset-yes": () => { updateCard(state.view.deck, state.view.card, { s: 0, due: 0, ivl: 0, ease: 2.5, step: 0, reps: 0, lapses: 0, intro: undefined, fs: undefined, fd: undefined, last: undefined, flag: undefined }); render(); },
+    "w-edit": () => go({ name: "deck", deck: state.view.deck, edit: state.view.card }),
+    "w-verb": () => { state.view.asVerb = true; render(); }, "w-noverb": () => { state.view.asVerb = false; render(); },
+    "w-kind": () => { state.view.formKind = id; render(); },
+    "opts-all": () => { const src = state.decks[state.view.deck]; for (const d of deckList()) if (d !== src) { d.opts = { ...(src.opts || {}) }; d.newPerDay = src.newPerDay; saveDeck(d); } const m = document.getElementById("opts-msg"); m.hidden = false; m.textContent = "Параметры применены ко всем колодам"; },
+    "opts-reset": () => { const d = state.decks[state.view.deck]; d.opts = {}; d.newPerDay = S.DEFAULT_NEW_PER_DAY; d.reverse = false; saveDeck(d); render(); },
+    "t-source": () => { state.testCfg.source = id; render(); },
     "edit": () => { state.view.edit = id; render(); window.scrollTo(0, 0); },
     "more-cards": () => { state.view.limit = (state.view.limit || 100) + 100; document.getElementById("cl").innerHTML = cardListHtml(state.decks[state.view.deck], Date.now()); }, "cancel-edit": () => { state.view.edit = null; render(); },
     "del-card": () => { const d = state.decks[state.view.deck]; d.cards = d.cards.filter(c => c.id !== id); saveDeck(d); render(); },
