@@ -1,0 +1,43 @@
+name: Keep Supabase awake
+
+on:
+  schedule:
+    - cron: "17 6 */3 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Touch the database
+        run: |
+          URL=$(grep -oP 'supabaseUrl:\s*"\K[^"]*' config.js || true)
+          KEY=$(grep -oP 'supabaseKey:\s*"\K[^"]*' config.js || true)
+          if [ -z "$URL" ] || [ -z "$KEY" ]; then
+            echo "config.js has no Supabase project yet, nothing to keep awake."
+            exit 0
+          fi
+          code=$(curl -s -o response.txt -w '%{http_code}' -X POST "$URL/rest/v1/rpc/keepalive" \
+            -H "apikey: $KEY" -H "Content-Type: application/json" -d '{}')
+          echo "HTTP $code: $(cat response.txt)"
+          if [ "$code" -ge 300 ]; then
+            echo "::error::Supabase did not answer. If the project is paused, open supabase.com and press Restore."
+            exit 1
+          fi
+
+      - name: Keep this repository active
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 40 * 86400 )) ]; then
+            date -u +%Y-%m-%dT%H:%M:%SZ > .keepalive
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .keepalive
+            git commit -m "chore: keep the scheduled database ping enabled"
+            git push
+          fi
