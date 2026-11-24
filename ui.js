@@ -822,6 +822,7 @@ function renderDict() {
   const chip = (v, t, n) => `<button class="chip ${f.status === v ? "on" : ""}" data-act="dict-status" data-id="${v}">${t}${n !== undefined ? ` <span class="cnt">${n}</span>` : ""}</button>`;
   app.innerHTML = `<h1>Словарь</h1>
   <p class="muted">Все ваши слова: что уже знаете, что повторяете, что ещё впереди. Нажмите на слово, чтобы увидеть примеры, формы и прогресс.</p>
+  <a class="btn ghost" style="align-self:flex-start;text-decoration:none" href="https://claude.ai/artifact/DLRiJ4GpygqzkwUEHBwkc7" target="_blank" rel="noopener">Разбор фраз: огласовки, перевод, иʿраб →</a>
   <div class="panel">
     <input dir="auto" id="dict-q" type="search" placeholder="Поиск по слову или переводу" value="${esc(f.q)}">
     <div class="row" style="gap:6px">${chip("all", "Все", all.length)}${chip("known", "Знаю", cnt.known)}${chip("review", "Повторяю", cnt.review)}${chip("learn", "Изучаю", cnt.learn)}${chip("new", "Новые", cnt.new)}${chip("hard", "★ Трудные", hard)}${cnt.sus ? chip("sus", "Приостановлены", cnt.sus) : ""}</div>
