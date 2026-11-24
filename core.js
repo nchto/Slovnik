@@ -24,7 +24,7 @@ const byteSize = obj => new TextEncoder().encode(JSON.stringify(obj)).length;
 /* ---------- study options ---------- */
 const DEFAULT_OPTS = Object.freeze({
   algo: "sm2", retention: 0.9, steps: [1, 10], relearn: [10], gradIvl: 1, easyIvl: 4, maxIvl: 36500,
-  newOrder: "seq", revOrder: "due", mix: "mix", maxRev: 200, learnAhead: false, dir: "fwd", leech: 8, leechAction: "flag"
+  newOrder: "seq", revOrder: "due", mix: "mix", maxRev: 200, learnAhead: false, dir: "fwd", leech: 8, leechAction: "flag", harakat: "show", translit: true
 });
 function deckOpts(deck) {
   const o = { ...DEFAULT_OPTS, ...(deck && deck.opts) };
@@ -233,9 +233,81 @@ function wordStatus(c) {
 }
 const isHard = c => !!c.flag || (c.lapses || 0) >= 3;
 
+/* ---------- Arabic ---------- */
+const AR_LETTERS = "\\u0621-\\u063A\\u0641-\\u064A\\u066E-\\u06D3\\u06FA-\\u06FF\\u0750-\\u077F\\uFB50-\\uFDFF\\uFE70-\\uFEFC";
+const AR_MARKS = "\\u0610-\\u061A\\u064B-\\u065F\\u0670\\u06D6-\\u06ED\\u0640";
+const AR_ANY = new RegExp("[" + AR_LETTERS + "]");
+const AR_HARAKAT = new RegExp("[" + AR_MARKS + "]", "g");
+const AR_RUN = new RegExp("[" + AR_LETTERS + AR_MARKS + "]+(?:[\\s\\u060C\\u061B\\u061F.,!?:;«»()\\[\\]\\-–—/]*[" + AR_LETTERS + AR_MARKS + "]+)*", "g");
+const hasArabic = s => AR_ANY.test(String(s || ""));
+const hasHarakat = s => /[ً-ْٰ]/.test(String(s || ""));
+const stripHarakat = s => String(s || "").replace(AR_HARAKAT, "");
+function arLoose(s) {
+  return stripHarakat(s).replace(/[أإآٱ]/g, "ا").replace(/ى/g, "ي").replace(/ة/g, "ه").replace(/ؤ/g, "و").replace(/ئ/g, "ي")
+    .replace(/ک/g, "ك").replace(/ی/g, "ي").split(/\s+/).map(w => w.length > 3 ? w.replace(/^ال/, "") : w).join(" ");
+}
+const AR_CONS = { "ب": "b", "ت": "t", "ث": "th", "ج": "j", "ح": "ḥ", "خ": "kh", "د": "d", "ذ": "dh", "ر": "r", "ز": "z", "س": "s", "ش": "sh",
+  "ص": "ṣ", "ض": "ḍ", "ط": "ṭ", "ظ": "ẓ", "ع": "ʿ", "غ": "gh", "ف": "f", "ق": "q", "ك": "k", "ل": "l", "م": "m", "ن": "n", "ه": "h",
+  "و": "w", "ي": "y", "ء": "ʾ", "أ": "ʾ", "إ": "ʾ", "ؤ": "ʾ", "ئ": "ʾ", "ک": "k", "ی": "y" };
+const SUN_LETTERS = new Set("تثدذرزسشصضطظلن");
+const MARK_RE = /[ً-ٰٟ]/;
+function vowelOf(m) {
+  if (m.includes("َ")) return "a";
+  if (m.includes("ِ")) return "i";
+  if (m.includes("ُ")) return "u";
+  if (m.includes("ً")) return "an";
+  if (m.includes("ٍ")) return "in";
+  if (m.includes("ٌ")) return "un";
+  if (m.includes("ٰ")) return "ā";
+  return "";
+}
+function translitWord(w) {
+  const toks = [];
+  for (const ch of w) {
+    if (ch === "ـ") continue;
+    if (MARK_RE.test(ch)) { if (toks.length) toks[toks.length - 1].m += ch; }
+    else toks.push({ c: ch, m: "" });
+  }
+  let out = "", i = 0;
+  if (toks.length > 3 && (toks[0].c === "ا" || toks[0].c === "ٱ") && toks[1].c === "ل" && !vowelOf(toks[1].m)) {
+    const nx = toks[2];
+    if (SUN_LETTERS.has(nx.c) && nx.m.includes("ّ")) { out = "a" + AR_CONS[nx.c] + "-"; nx.single = true; }
+    else out = "al-";
+    i = 2;
+  }
+  for (; i < toks.length; i++) {
+    const t = toks[i], prev = toks[i - 1], c = t.c, v = vowelOf(t.m), sh = t.m.includes("ّ");
+    if (c === "ا" || c === "ٱ") {
+      if (i === 0) { out += v; continue; }
+      if (prev && prev.m.includes("ً")) continue;
+      if (out.endsWith("a")) out = out.slice(0, -1);
+      out += "ā"; continue;
+    }
+    if (c === "آ") { out += (i === 0 ? "" : "ʾ") + "ā"; continue; }
+    if (c === "ى") { if (prev && prev.m.includes("ً")) continue; if (out.endsWith("a")) out = out.slice(0, -1); out += "ā"; continue; }
+    if ((c === "و" || c === "ي") && !v && !sh && prev && !t.m.includes("ْ")) {
+      const pv = vowelOf(prev.m);
+      if (c === "و" && pv === "u") { out = out.slice(0, -1) + "ū"; continue; }
+      if (c === "ي" && pv === "i") { out = out.slice(0, -1) + "ī"; continue; }
+    }
+    if (c === "ة") { out += v ? "t" + v : (i === toks.length - 1 ? "" : "t"); continue; }
+    let cons = AR_CONS[c];
+    if (cons === undefined) { out += c; continue; }
+    if (i === 0 && "ءأإ".includes(c)) cons = "";
+    if (c === "إ" && !v) { out += cons + "i"; continue; }
+    out += (sh && !t.single ? cons + cons : cons) + v;
+  }
+  return out;
+}
+function translitArabic(text) {
+  const s = String(text || "");
+  if (!hasHarakat(s)) return "";
+  return s.replace(AR_RUN, run => run.split(/(\s+)/).map(w => /\s/.test(w) || !hasArabic(w) ? w : translitWord(w)).join(""));
+}
+
 /* ---------- answer checking ---------- */
 function normalize(s) {
-  return String(s).toLowerCase().replace(/ё/g, "е").replace(/\([^)]*\)|\[[^\]]*\]/g, " ")
+  return String(s).normalize("NFC").toLowerCase().replace(/ё/g, "е").replace(AR_HARAKAT, "").replace(/\([^)]*\)|\[[^\]]*\]/g, " ")
     .replace(/[^\p{L}\p{N}\s'-]/gu, " ").replace(/\s+/g, " ").trim();
 }
 const stripArticle = s => s.replace(/^(to|the|a|an|der|die|das|le|la|les|el|los|las|il|lo|un|une)\s+/, "");
@@ -255,8 +327,12 @@ function checkAnswer(input, expected) {
   const variants = new Set([normalize(expected), ...String(expected).split(/[,;/\n]| или /).map(normalize)].filter(Boolean));
   for (const v of variants) if (v === given || stripArticle(v) === stripArticle(given)) return "correct";
   for (const v of variants) {
-    const a = stripArticle(v), b = stripArticle(given), d = levenshtein(a, b);
-    if ((a.length >= 4 && d <= 1) || (a.length >= 8 && d <= 2)) return "typo";
+    const a = stripArticle(v), b = stripArticle(given), d = levenshtein(a, b), ar = hasArabic(a) ? 2 : 0;
+    if ((a.length >= 4 + ar && d <= 1) || (a.length >= 8 + ar && d <= 2)) return "typo";
+  }
+  if (hasArabic(expected)) {
+    const g = arLoose(given);
+    for (const v of variants) { const a = arLoose(v); if (a === g) return "typo"; if (a.length >= 6 && levenshtein(a, g) <= 1) return "typo"; }
   }
   return "wrong";
 }
@@ -643,12 +719,17 @@ function looksLikeVerb(card) {
 }
 
 /* ---------- Wiktionary ---------- */
-const LANGS = { en: "English", nl: "Dutch", de: "German", fr: "French", es: "Spanish", it: "Italian", pt: "Portuguese", sv: "Swedish", pl: "Polish", tr: "Turkish", ru: "Russian" };
-const LANG_RU = { en: "Английский", nl: "Нидерландский", de: "Немецкий", fr: "Французский", es: "Испанский", it: "Итальянский", pt: "Португальский", sv: "Шведский", pl: "Польский", tr: "Турецкий", other: "Другой" };
+const LANGS = { ar: "Arabic", en: "English", nl: "Dutch", de: "German", fr: "French", es: "Spanish", it: "Italian", pt: "Portuguese", sv: "Swedish", pl: "Polish", tr: "Turkish", ru: "Russian" };
+const LANG_RU = { ar: "Арабский", en: "Английский", nl: "Нидерландский", de: "Немецкий", fr: "Французский", es: "Испанский", it: "Итальянский", pt: "Португальский", sv: "Шведский", pl: "Польский", tr: "Турецкий", other: "Другой" };
 const POS_RU = { Verb: "глагол", Noun: "существительное", Adjective: "прилагательное", Adverb: "наречие", Pronoun: "местоимение", Preposition: "предлог",
   Conjunction: "союз", Interjection: "междометие", Phrase: "фраза", Idiom: "идиома", Determiner: "определитель", Numeral: "числительное", Article: "артикль",
   Particle: "частица", "Proper noun": "имя собственное", Prefix: "приставка", Suffix: "суффикс", Proverb: "пословица", "Prepositional phrase": "предложная фраза" };
-function lookupWord(card) {
+function lookupWord(card, lang) {
+  if (lang === "ar") {
+    const src = hasArabic(card.f) ? card.f : card.b;
+    const m = stripHarakat(src).replace(/ٱ/g, "ا").match(AR_RUN);
+    return m ? m[0].split(/[\u060C\u061B,;/\n(]/)[0].trim() : "";
+  }
   return String(card.f || "").replace(/\([^)]*\)|\[[^\]]*\]/g, " ").split(/[,;/\n]/)[0].replace(/^\s*to\s+/i, "").replace(/^(the|a|an|de|het|een|der|die|das|le|la|les|el|los|las|il|lo)\s+/i, "").trim();
 }
 function parseWiktDefinitions(json, lang) {
@@ -709,7 +790,7 @@ const QUOTES = [
 ];
 const quoteIndex = (now, shift = 0) => { const n = Math.floor(dayStart(now) / DAY) + shift; return ((n * 7) % QUOTES.length + QUOTES.length) % QUOTES.length; };
 
-return { englishVerb, englishPlural, looksLikeVerb, LANGS, LANG_RU, lookupWord, parseWiktDefinitions, DEFAULT_OPTS, deckOpts, parseSteps, fmtSteps, hash, fsrsR, recallChance, memoryOf, reviewIntervals, isLearning, revLeft,
+return { hasArabic, hasHarakat, stripHarakat, arLoose, translitArabic, AR_RUN, englishVerb, englishPlural, looksLikeVerb, LANGS, LANG_RU, lookupWord, parseWiktDefinitions, DEFAULT_OPTS, deckOpts, parseSteps, fmtSteps, hash, fsrsR, recallChance, memoryOf, reviewIntervals, isLearning, revLeft,
   cardDirection, earliestLearning, wordStatus, isHard, MIN, DAY, DEFAULT_NEW_PER_DAY, CHUNK_TARGET, uid, dayStart, dayKey, shuffle, serialize, deserialize, byteSize,
   newCard, schedule, fmtInterval, counts, nextCard, nextLearnDue, newLeft, normalize, checkAnswer,
   parseImport, parseCSV, parseTextFile, htmlToText, hasCloze, clozeFront, clozeBack, readAnkiPackage, cardFromAnki,
